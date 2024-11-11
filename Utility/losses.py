@@ -6,7 +6,7 @@ from transformers import Wav2Vec2FeatureExtractor, WavLMModel, WavLMForXVector
 
 
 sv_model = SVModel.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM", 
-                              use_auth_token="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")
+                              use_auth_token="YOUR_AUTH_TOKEN")
 sv_model = sv_model.eval()
 
 
