@@ -2,13 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Conv1d, AvgPool1d, Conv2d
-from torch.nn.utils import weight_norm, spectral_norm
+from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils import spectral_norm
 from audiotools import AudioSignal
 from audiotools import ml
 from audiotools import STFTParams
 from einops import rearrange
 from torchaudio.models import Conformer
-from normalizations import LinearNorm
+from .normalizations import LinearNorm
 from Utility.utils import *
 
 

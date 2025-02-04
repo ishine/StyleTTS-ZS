@@ -1,5 +1,3 @@
-from monotonic_align import maximum_path
-from monotonic_align import mask_from_lens
 from monotonic_align.core import maximum_path_c
 import numpy as np
 import torch
@@ -9,8 +7,7 @@ from functools import reduce
 from inspect import isfunction
 from math import ceil, floor, log2
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
-
-import torch
+from torch import Tensor
 from typing_extensions import TypeGuard
 
 def init_weights(m, mean=0.0, std=0.01):
@@ -308,3 +305,51 @@ def merge_batches(batch1, batch2):
     ref_lengths[mels1.size(0):] = ref_lengths2
 
     return waves, texts, input_lengths, mels, mel_input_length, ref_texts, ref_lengths, adj_mels, adj_mels_lengths
+
+
+def random_mask_tokens(input_tensor, M, part=5):
+    """
+    Randomly mask tokens in the input tensor, ensuring at least M portion remains unmasked.
+
+    Args:
+    input_tensor (torch.Tensor): The input tensor of shape [512, T].
+    M (float): The minimum portion of tokens that should remain unmasked.
+
+    Returns:
+    torch.Tensor: The masked input tensor.
+    """
+    B, T = input_tensor.shape
+
+    if T <= M:
+        return input_tensor
+    masked_part = np.random.randint(0, part)
+    
+    max_mask = T - M
+    masked_len = 0
+    
+    masked_tensor = input_tensor.clone()
+    for i in range(masked_part):
+        mask_start = np.random.randint(0, T)
+        mask_end = np.random.randint(mask_start, T)
+        
+        if (mask_end - mask_start) + masked_len > max_mask:
+            continue
+            
+        masked_tensor[:, mask_start:mask_end] = 0
+        
+        masked_len += (mask_end - mask_start)
+
+    return masked_tensor
+
+def to_batch(
+    batch_size: int,
+    device: torch.device,
+    x: Optional[float] = None,
+    xs: Optional[Tensor] = None,
+) -> Tensor:
+    assert exists(x) ^ exists(xs), "Either x or xs must be provided"
+    # If x provided use the same for all batch items
+    if exists(x):
+        xs = torch.full(size=(batch_size,), fill_value=x).to(device)
+    assert exists(xs)
+    return xs

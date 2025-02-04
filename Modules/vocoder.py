@@ -1,9 +1,10 @@
 import torch
 from torch import nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
-from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
-from Modules.adain_blocks import *
-from sourcemodulehnnsf import SourceModuleHnNSF
+from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils import remove_weight_norm, spectral_norm
+from .adain_blocks import *
+from .sourcemodulehnnsf import SourceModuleHnNSF
 import numpy as np
 from torchaudio.models import Conformer
 
@@ -94,14 +95,14 @@ class Generator(torch.nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, dim_in=512, F0_channel=512, style_dim=64, dim_out=80, 
+    def __init__(self, dim_in=512, F0_channel=512, style_dim=64, dim_out=80, training=False,
                 resblock_kernel_sizes = [3,7,11],
                 upsample_rates = [10,5,3,2],
                 upsample_initial_channel=512,
                 resblock_dilation_sizes=[[1,3,5], [1,3,5], [1,3,5]],
                 upsample_kernel_sizes=[20,10,6,4]):
         super().__init__()
-        
+        self.training=training
         self.decode = nn.ModuleList()
         
         self.conformer = Conformer(

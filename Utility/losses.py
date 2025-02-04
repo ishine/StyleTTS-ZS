@@ -1,17 +1,7 @@
 import torch
 import torchaudio
 import torch.nn.functional as F
-from pyannote.audio import Model as SVModel
 from transformers import Wav2Vec2FeatureExtractor, WavLMModel, WavLMForXVector
-
-
-sv_model = SVModel.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM", 
-                              use_auth_token="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")
-sv_model = sv_model.eval()
-
-
-wavlm = WavLMModel.from_pretrained('microsoft/wavlm-base-plus-sv').to('cuda')
-
 
 def discriminator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):
     loss = 0
@@ -59,6 +49,48 @@ class GeneratorLoss(torch.nn.Module):
         loss_gen_all = loss_g + loss_feature + loss_rel
         
         return loss_gen_all.mean()
+
+class ProsodyGeneratorLoss(torch.nn.Module):
+
+    def __init__(self, discriminator):
+        """Initilize spectral convergence loss module."""
+        super(ProsodyGeneratorLoss, self).__init__()
+        self.discriminator = discriminator
+        
+    def forward(self, pred, real, h, mel_input_length, s2s_attn_mono):
+        f_out, f_hidden = self.discriminator(pred, 
+                      h.detach(), 
+                      mel_input_length // (2), 
+                      s2s_attn_mono.size(-1))
+        
+        with torch.no_grad():
+            r_out, r_hidden = self.discriminator(real.detach(), 
+                          h.detach(), 
+                          mel_input_length // (2), 
+                          s2s_attn_mono.size(-1))
+        
+        loss_gens = []
+        loss_fms = []
+        for bib in range(len(mel_input_length)):
+            mel_len = mel_input_length[bib] // 2
+
+            loss_gen = torch.mean((1-f_out[bib, :mel_len])**2) +\
+                        generator_TPRLS_loss([r_out[bib, :mel_len].unsqueeze(0)], 
+                                              [f_out[bib, :mel_len].unsqueeze(0)])
+            
+            loss_fm = 0
+            for r, f in zip(r_hidden, f_hidden):
+                loss_fm += F.l1_loss(r[bib, :mel_len], f[bib, :mel_len])
+
+            if not torch.isnan(loss_gen):
+                loss_gens.append(loss_gen)
+            
+            loss_fms.append(loss_fm)
+            
+        loss_gen = torch.stack(loss_gens).mean()
+        loss_fm = torch.stack(loss_fms).mean()
+
+        return loss_gen, loss_fm
     
 class DiscriminatorLoss(torch.nn.Module):
 
@@ -84,13 +116,45 @@ class DiscriminatorLoss(torch.nn.Module):
         
         return d_loss.mean()
 
+class ProsodyDiscriminatorLoss(torch.nn.Module):
+
+    def __init__(self, discriminator):
+        """Initilize spectral convergence loss module."""
+        super(ProsodyDiscriminatorLoss, self).__init__()
+        self.discriminator = discriminator
+        
+    def forward(self, pred, real, h, mel_input_length, s2s_attn_mono):
+        f_out, _ = self.discriminator(pred.detach(), 
+                      h.detach(), 
+                      mel_input_length // (2), 
+                      s2s_attn_mono.size(-1))
+        r_out, _ = self.discriminator(real.detach(), 
+                      h.detach(), 
+                      mel_input_length // (2), 
+                      s2s_attn_mono.size(-1))
+    
+    
+        loss_diss = []
+        for bib in range(len(mel_input_length)):
+            mel_len = mel_input_length[bib] // 2
+
+            loss_dis = torch.mean((f_out[bib, :mel_len])**2) +\
+                        torch.mean((1-r_out[bib, :mel_len])**2) +\
+                        discriminator_TPRLS_loss([r_out[bib, :mel_len].unsqueeze(0)], 
+                                               [f_out[bib, :mel_len].unsqueeze(0)])
+            if not torch.isnan(loss_dis):
+                loss_diss.append(loss_dis)
+
+        d_loss = torch.stack(loss_diss).mean()
+        
+        return d_loss
 
 class WavLMLoss(torch.nn.Module):
 
-    def __init__(self, wavlm, mwd):
+    def __init__(self, mwd):
         """Initilize spectral convergence loss module."""
         super(WavLMLoss, self).__init__()
-        self.wavlm = wavlm
+        self.wavlm = WavLMModel.from_pretrained('microsoft/wavlm-base-plus-sv').to('cuda')
         self.mwd = mwd
         self.resample = torchaudio.transforms.Resample(24000, 16000)
         
@@ -175,28 +239,53 @@ class WavLMLoss(torch.nn.Module):
         return d_loss.mean()
 
 
-class SVLoss(torch.nn.Module):
+# This needs to be changed to the Pyannote, but just to have the code working
 
-    def __init__(self, sv_model):
-        """Initilize spectral convergence loss module."""
+class SVLoss(torch.nn.Module): 
+    def __init__(self):
+        """Initialize spectral convergence loss module."""
         super(SVLoss, self).__init__()
         self.resample = torchaudio.transforms.Resample(24000, 16000)
-        self.sv_model = sv_model
-        
+        self.sv_model = WavLMForXVector.from_pretrained('microsoft/wavlm-base-plus-sv')
+        self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained('microsoft/wavlm-base-plus-sv')
+       
     def forward(self, y, y_hat):
-        y_hat = self.resample(y_hat)
-        h_fake, emb_fake = self.sv_model(y_hat, return_features=True)
+    
+        y = y.squeeze(1) if y.dim() == 4 else y
+        y_hat = y_hat.squeeze(1) if y_hat.dim() == 4 else y_hat
+        
+
+        if y.size(1) > 1:
+            y = y.mean(dim=1, keepdim=True)
+        if y_hat.size(1) > 1:
+            y_hat = y_hat.mean(dim=1, keepdim=True)
+
+        y = self.resample(y.squeeze(1))
+        y_hat = self.resample(y_hat.squeeze(1))
+        
+
+        y_np = y.detach().cpu().numpy()
+        y_hat_np = y_hat.detach().cpu().numpy()
+        
+
+        h_real = self.feature_extractor(y_np, sampling_rate=16000, padding=True, return_tensors="pt")
+        h_fake = self.feature_extractor(y_hat_np, sampling_rate=16000, padding=True, return_tensors="pt")
+
+        h_real = {k: v.to(y.device) for k, v in h_real.items()}
+        h_fake = {k: v.to(y_hat.device) for k, v in h_fake.items()}
         
         with torch.no_grad():
-            y = self.resample(y)
-            h_real, emb_real = self.sv_model(y, return_features=True)
+            emb_real = self.sv_model(**h_real).embeddings
+        emb_fake = self.sv_model(**h_fake).embeddings
         
-        loss_feat = 0
-        for x_fake, x_real in zip(h_fake, h_real):
-            loss_feat += F.l1_loss(x_fake, x_real)
+
+        emb_real = F.normalize(emb_real, dim=-1)
+        emb_fake = F.normalize(emb_fake, dim=-1)
         
+        # Compute losses
+        loss_feat = F.l1_loss(h_fake['input_values'], h_real['input_values'])
         loss_sim = 1 - F.cosine_similarity(emb_fake, emb_real, dim=-1).mean()
-        
+       
         return loss_feat, loss_sim
 
 

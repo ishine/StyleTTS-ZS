@@ -37,14 +37,15 @@ for i in range(len((symbols))):
 class TextCleaner:
     def __init__(self, dummy=None):
         self.word_index_dictionary = dicts
-        print(len(dicts))
+        #print(len(dicts))
     def __call__(self, text):
         indexes = []
         for char in text:
             try:
                 indexes.append(self.word_index_dictionary[char])
             except KeyError:
-                print(text)
+                pass
+                #print(text)
         return indexes
 
 np.random.seed(1)
@@ -77,13 +78,14 @@ class FilePathDataset(torch.utils.data.Dataset):
                  ):
 
         _data_list = [l[:-1].split('|') for l in data_list]
-        self.data_list = [data if len(data) == 4 else (*data, 0) for data in _data_list]
+        self.data_list = [data if len(data) == 5 else (*data, 0) for data in _data_list]
+        self.df = pd.DataFrame(self.data_list)
         self.text_cleaner = TextCleaner()
         self.sr = sr
 
         self.to_melspec = torchaudio.transforms.MelSpectrogram(**MEL_PARAMS)
 
-        self.mean, self.std = -4, 4
+        #self.mean, self.std = -4, 4
         self.data_augmentation = data_augmentation and (not validation)
         self.max_mel_length = 192
         
@@ -105,22 +107,35 @@ class FilePathDataset(torch.utils.data.Dataset):
         mel_tensor = preprocess(wave).squeeze()
         
         try:
-            if bool(random.getrandbits(1)):
-                adj_path = data[1]
+            adj_path = data[1]
+            adj_txt = data[-1]
+            
+            if adj_txt == "" or "|" in adj_txt or "    " in adj_txt:
+                mel_adj = mel_tensor
+                text_adj = text_tensor
+            else:
+            
                 adj_wave, sr = sf.read(adj_path)
                 if adj_wave.shape[-1] == 2:
                     adj_wave = wave[:, 0].squeeze()
                 if sr != 24000:
                     adj_wave = librosa.resample(adj_wave, sr, 24000)
-                    print(adj_path, sr)
+                    #print(adj_path, sr)
 
                 adj_wave = np.concatenate([np.zeros([5000]), adj_wave, np.zeros([5000])], axis=0)
 
                 mel_adj = preprocess(adj_wave).squeeze()
-            else:
-                mel_adj = mel_tensor
+                
+                text = self.text_cleaner(adj_txt)
+
+                text.insert(0, 0)
+                text.append(0)
+
+                text_adj = torch.LongTensor(text)
+
         except:
             mel_adj = mel_tensor
+            text_adj = text_tensor
         
         acoustic_feature = mel_tensor.squeeze()
         length_feature = acoustic_feature.size(1)
@@ -131,23 +146,23 @@ class FilePathDataset(torch.utils.data.Dataset):
         acoustic_adj = acoustic_adj[:, :(length_adj - length_adj % 2)]
         
         try:
-            ref_data = random.choice(self.data_list)
-            ref_mel_tensor, ref_label = self._load_data(ref_data)
+            ref_data = (self.df[self.df[3] == str(speaker_id)]).sample(n=1).iloc[0].tolist()
+            ref_mel_tensor, ref_label = self._load_data(ref_data[:5])
         except:
             print(ref_data[0])
             return self.__getitem__(idx - 1 if idx > 1 else len(self.data_list) - 1)
         
-        return speaker_id, acoustic_feature, text_tensor, ref_mel_tensor, ref_label, path, wave, acoustic_adj
+        return speaker_id, acoustic_feature, text_tensor, ref_mel_tensor, ref_label, path, wave, acoustic_adj, text_adj
 
     def _load_tensor(self, data):
-        wave_path, _, text, speaker_id = data
-        speaker_id = int(speaker_id)
+        wave_path, _, text, speaker_id, _ = data
+        #speaker_id = int(speaker_id)
         wave, sr = sf.read(wave_path)
         if wave.shape[-1] == 2:
             wave = wave[:, 0].squeeze()
         if sr != 24000:
-            wave = librosa.resample(wave, sr, 24000)
-            print(wave_path, sr)
+            wave = librosa.resample(wave, orig_sr=sr, target_sr=24000)
+            #print(wave_path, sr)
             
         wave = np.concatenate([np.zeros([5000]), wave, np.zeros([5000])], axis=0)
         
@@ -186,7 +201,6 @@ class Collater(object):
         
 
     def __call__(self, batch):
-        # batch[0] = wave, mel, text, f0, speakerid
         batch_size = len(batch)
 
         # sort by mel length
@@ -197,29 +211,40 @@ class Collater(object):
         nmels = batch[0][1].size(0)
         max_mel_length = max([b[1].shape[1] for b in batch])
         max_text_length = max([b[2].shape[0] for b in batch])
-        
-        max_ref_length = max([b[-1].shape[1] for b in batch])
+        max_rt_length = max([b[-1].shape[0] for b in batch])
 
-        labels = torch.zeros((batch_size)).long()
+        max_ref_length = max([b[-2].shape[1] for b in batch])
+
+        labels = ['' for _ in range(batch_size)]
         mels = torch.zeros((batch_size, nmels, max_mel_length)).float()
         texts = torch.zeros((batch_size, max_text_length)).long()
+        
+        ref_texts = torch.zeros((batch_size, max_rt_length)).long()
+
         input_lengths = torch.zeros(batch_size).long()
+        ref_lengths = torch.zeros(batch_size).long()
         output_lengths = torch.zeros(batch_size).long()
         ref_mels = torch.zeros((batch_size, nmels, self.max_mel_length)).float()
-        ref_labels = torch.zeros((batch_size)).long()
+        ref_labels = ['' for _ in range(batch_size)]
         paths = ['' for _ in range(batch_size)]
         waves = [None for _ in range(batch_size)]
         
         adj_mels = torch.zeros((batch_size, nmels, max_ref_length)).float()
         adj_mels_lengths = torch.zeros(batch_size).long()
         
-        for bid, (label, mel, text, ref_mel, ref_label, path, wave, adj_mel) in enumerate(batch):
+        for bid, (label, mel, text, ref_mel, ref_label, path, wave, adj_mel, adj_text) in enumerate(batch):
             mel_size = mel.size(1)
             text_size = text.size(0)
+            rt_size = adj_text.size(0)
+
             labels[bid] = label
             mels[bid, :, :mel_size] = mel
             texts[bid, :text_size] = text
+            ref_texts[bid, :rt_size] = adj_text
+
             input_lengths[bid] = text_size
+            ref_lengths[bid] = rt_size
+            
             output_lengths[bid] = mel_size
             paths[bid] = path
             ref_mel_size = ref_mel.size(1)
@@ -232,7 +257,7 @@ class Collater(object):
             waves[bid] = wave
             adj_mels_lengths[bid] = adj_mels_size
 
-        return waves, texts, input_lengths, mels, output_lengths, labels, ref_mels, ref_labels, adj_mels, adj_mels_lengths
+        return waves, texts, input_lengths, mels, output_lengths, labels, ref_mels, ref_labels, adj_mels, adj_mels_lengths, ref_texts, ref_lengths
 
 
 

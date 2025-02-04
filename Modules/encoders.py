@@ -1,9 +1,13 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from torch.nn.utils import weight_norm, spectral_norm
-from normalizations import *
-from resblock import ResBlk
+from torch.nn.utils.parametrizations import weight_norm
+from .normalizations import *
+from .attentions import Attention
+from .embeddings import NumberEmbedder
+#from resblock import ResBlk
+from Utility.utils import length_to_mask
+from torchaudio.models import Conformer
 import math
 
 class TextEncoder(nn.Module):
@@ -70,55 +74,111 @@ class TextEncoder(nn.Module):
         return mask
 
 
-class TVStyleEncoder(nn.Module):
-    def __init__(self, pre_out=512, dim_in=48, style_dim=48, max_conv_dim=384):
+class StyleEncoder(nn.Module):
+    def __init__(self, mel_dim=80, text_dim=512, style_dim=128, num_heads=8, num_layers=6):
         super().__init__()        
-        blocks = []
-        blocks += [spectral_norm(nn.Conv2d(1, dim_in, 3, 1, 1))]
+        self.mel_proj = nn.Conv1d(mel_dim, text_dim, kernel_size=3, padding=1)
+        self.conformer_pre = Conformer(
+             input_dim=text_dim,
+             num_heads=num_heads,
+             ffn_dim=text_dim * 2,
+             num_layers=1,
+             depthwise_conv_kernel_size=31,
+             use_group_norm=True,
+        )
+        self.conformer_body = Conformer(
+             input_dim=text_dim,
+             num_heads=num_heads,
+             ffn_dim=text_dim * 2,
+             num_layers=num_layers - 1,
+             depthwise_conv_kernel_size=15,
+            use_group_norm=True,
+        )
+        self.out = nn.Linear(text_dim, style_dim)
+        
+    def forward(self, mel, text, input_lengths, max_size):
+        text_return = torch.zeros(text.size(0), text.size(1), max_size).to(text.device)
+        
+        text = text[..., :input_lengths.max()]
+        
+        mel = self.mel_proj(mel)
+        mel_len = mel.size(-1) # length of mel
 
-        repeat_num = 4
-        for i in range(repeat_num):
-            dim_out = min(dim_in*2, max_conv_dim)
-            if i % 2 == 0:
-                blocks += [ResBlk(dim_in, dim_out, downsample='half')]
-            else:
-                blocks += [ResBlk(dim_in, dim_out, downsample='timepreserve')]
-            dim_in = dim_out
+        input_lengths = input_lengths + mel_len
+        x = torch.cat([mel, text], axis=-1).transpose(-1, -2) # last dimension
+        
+        x, output_lengths = self.conformer_pre(x, input_lengths)
+        x, output_lengths = self.conformer_body(x, input_lengths)
+        x = x.transpose(-1, -2)
+        x_mel = x[:, :, :mel_len]
+        x_text = x[:, :, mel_len:]
+        
+        s = self.out(x_mel.mean(axis=-1))
+        text_return[:, :, :x_text.size(-1)] = x_text
         
         
-        blocks += [nn.LeakyReLU(0.2)]
-#         blocks += [spectral_norm(nn.Conv2d(dim_out, dim_out, 5, 1, 0))]
-#         blocks += [nn.AdaptiveAvgPool2d((1, None))]
-        self.to_q = spectral_norm(nn.Conv2d(dim_out, dim_out, 5, 1, 0))
-        self.to_k = spectral_norm(nn.Conv2d(dim_out, dim_out, 5, 1, 0))
-        self.to_v = spectral_norm(nn.Conv2d(dim_out, dim_out, 5, 1, 0))
+        return s, text_return
 
-        self.scale = dim_out ** -0.5
+
+class TVStyleEncoder(nn.Module):
+    def __init__(self, mel_dim=80, text_dim=512, 
+                 num_heads=8, num_time=50, num_layers=6,
+                 head_features=64):
+        super().__init__()
         
-        self.shared = nn.Sequential(*blocks)
+        self.mel_proj = nn.Conv1d(mel_dim, text_dim, kernel_size=3, padding=1)
         
-        self.out = nn.Linear(dim_out, style_dim)
-        self.relu = nn.LeakyReLU(0.2)
+        self.conformer_pre = Conformer(
+             input_dim=text_dim,
+             num_heads=num_heads,
+             ffn_dim=text_dim * 2,
+             num_layers=1,
+             depthwise_conv_kernel_size=31,
+             use_group_norm=True,
+        )
+        self.conformer_body = Conformer(
+             input_dim=text_dim,
+             num_heads=num_heads,
+             ffn_dim=text_dim * 2,
+             num_layers=num_layers - 1,
+             depthwise_conv_kernel_size=15,
+            use_group_norm=True,
+        )
         
-    def forward(self, x):        
-        h = self.shared(x)
-        q = self.to_q(h).squeeze(-2)
-        k = self.to_k(h).squeeze(-2)
-        h = self.to_v(h).squeeze(-2)
+        max_conv_dim = text_dim
         
-        # compute attention
-        batch_size = q.shape[0]
-        time = q.shape[-1]
-        sim = (k.transpose(-1, -2).reshape(batch_size * time, -1) * 
-               q.transpose(-1, -2).reshape(batch_size * time, -1)).sum(axis=-1)
-        sim = sim.reshape(batch_size, time) * self.scale
-        attn = sim.softmax(dim=-1).unsqueeze(1)
+        self.cross_attention = Attention(
+            features=max_conv_dim,
+            num_heads=num_heads,
+            head_features=head_features,
+            context_features=max_conv_dim,
+            use_rel_pos=False
+        )
+        self.num_time = num_time
+        self.positions = nn.Embedding(num_time, max_conv_dim)
+        
+        self.embedder = NumberEmbedder(features=max_conv_dim)
+        
+    def forward(self, x, input_lengths):
+        x = x[..., :input_lengths.max()]
+        
+        x = self.mel_proj(x)
+        x = x.transpose(-1, -2)
+        x, output_lengths = self.conformer_pre(x, input_lengths)
+        x, output_lengths = self.conformer_body(x, input_lengths)
+        h = x.transpose(-1, -2)
+        
+        idx = torch.arange(0, self.num_time).to(x.device)
+        positions = self.positions(idx).transpose(-1, -2).expand(x.shape[0], -1, -1)
+        
+        pos = self.embedder(torch.arange(h.shape[-1]).to(x.device)).transpose(-1, -2).expand(h.size(0), -1, -1)
+        h += pos
                 
-        o = self.relu(attn @ h.transpose(-1, -2))
-        o = o.view(o.size(0), -1)
-        out = self.out(o)
+        m = length_to_mask(input_lengths).to(x.device)
+        h.masked_fill_(m.unsqueeze(1), 0.0)
+        h = self.cross_attention(positions.transpose(-1, -2), context=h.transpose(-1, -2))
         
-        return out
+        return h.transpose(-1, -2)
 
 
 class DurationEncoder(nn.Module):
