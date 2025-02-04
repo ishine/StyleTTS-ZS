@@ -120,7 +120,7 @@ def main(config_path):
             iters = 0
 
     #sv_model = SVModel.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM", 
-    #                          use_auth_token="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")
+    #                          use_auth_token="")
     #sv_model = sv_model.eval()
 
     gl = GeneratorLoss(model.md).to('cuda')
