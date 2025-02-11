@@ -1,0 +1,8 @@
+*.ipynb
+*.t7
+*.pth
+*.pyc
+*.wav
+*.bin
+__pycache__
+tensorboard

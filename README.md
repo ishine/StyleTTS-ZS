@@ -1,3 +1,6 @@
+# This is a fork where the first stage training works with accelerate.
+The only issue from this code is that when you increase the batch size, training doesn't converge! Only works with batch size 2. Please, if you know how to solve this, contact me through the discord server! That would make training feasible for everyone. Right now it takes a lot to converge into something useful (around 0.3 val_loss).
+
 # StyleTTS-ZS: Efficient High-Quality Zero-Shot Text-to-Speech Synthesis with Distilled Time-Varying Style Diffusion
 
 ### Yinghao Aaron Li, Xilin Jiang, Cong Han, Nima Mesgarani
@@ -15,3 +18,4 @@ You can [join the discord server](https://discord.gg/aB9DeaTSJQ) if you can help
 ## Inference
 ### Under construction
 
+See inference_acoustic.py for waveform reconstruction.
